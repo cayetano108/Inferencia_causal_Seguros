@@ -1,0 +1,482 @@
+---
+title: "Trabajo de Inferencia Causal: Datos de cartera de seguros"
+subtitle: "Ciencia de Datos en Negocio, Máster en Ciencia de Datos, UV."
+author: 
+  - "Maria Gómez Mahiques"
+  - "Jorge Huerta Muñoz"
+  - "Cayetano Romero Monteagudo"
+  - "Cristina Vicedo Revert"
+date: "`r format(Sys.Date(), '%d-%m-%Y')`"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    toc_depth: 6
+    toc_float: true
+    theme: journal
+---
+
+<style>
+body {
+text-align: justify}
+</style>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE,
+	             cache=TRUE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+```
+
+
+
+```{r, echo=FALSE,results='hide'}
+
+## 1. Instalación de librerías.
+# Especificamos las librerías necesarias en esta lista
+
+packages = c("readxl","tidyverse","rsample","dagitty","corrplot", "MatchIt","cobalt")
+
+
+#use this function to check if each package is on the local machine
+#if a package is installed, it will be loaded
+#if any are not, the missing package(s) will be installed and loaded
+package.check <- lapply(packages, FUN = function(x) {
+  if (!require(x, character.only = TRUE)) {
+    install.packages(x, dependencies = TRUE,repos='http://cran.rediris.es')
+    library(x, character.only = TRUE)
+  }
+})
+
+#verify they are loaded
+search()
+
+```
+
+
+El objetivo de este trabajo es abordar un problema de inferencia causal en un contexto socio-económico, en este caso haciendo uso de una serie de datos procedentes a una cartera de seguros. Se analizará la influencia del tipo de coche asegurado sobre la siniestralidad.
+
+El dataset cuenta con una gran cantidad de variables : edad del cliente, fecha de inicio y vencimiento de la póliza, marca y cilindrada del vehículo, número de siniestros y el coste asociado, entre otras.
+
+# Descripción del problema
+
+## Análisis exploratorio
+
+En primer lugar se realiza un análisis exploratorio de los datos con el objetivo de analizar qué variables son de interés para el estudio y cuáles se pueden descartar, así como para ver posibles correlaciones o relaciones relevantes que se puedan dar entre las variables presentes.
+
+Se cargan los datos desde el archivo CSV disponible.
+
+
+```{r}
+seguros <- read_excel("seguro_automovil_causal.xlsx") 
+
+str(seguros) 
+summary(seguros)
+```
+
+
+Para medir la siniestralidad se va a trabajar con la cantidad total de accidentes que ha tenido un vehículo,de modo que se suman los accidentes con daños materiales y con daños corporales por póliza. Esto se hace bajo la suposición de que los accidentes son únicamente de un tipo: materiales o corporales.
+
+El tratamiento con el que se va a trabajar es si el cliente tiene un coche de coste de compra elevado. Se consdierará que el precio es alto a partir de 30.000 euros. Otro enfoque que se emplea consiste en considerar como tratamiento la experiencia o años con carnet del cliente, de modo que se introduce la variable `experiencia` de manera similar a precio, considerando como clietnes experimentados aquellos que están por encima del tercer cuantil, es decir, el 25% de clientes con más experiencia.
+
+
+```{r}
+quantile(seguros$Veh_val)
+```
+
+
+De este modo, se eliminará la variable 'Veh_val' y se generará una nueva, llamada 'precio', de modo que se asigna un 1 a coches de más de 30.0000 euros, y un 0 al resto de vehículos.
+
+
+```{r}
+seguros$precio <- ifelse(seguros$Veh_val >30000,1,0)
+
+seguros <- seguros %>% mutate(coste = C_rcmat_agregado + C_rccorp) 
+
+seguros$accidente <- seguros$N_rcmat + seguros$N_rccorp
+
+seguros$experiencia <- ifelse(seguros$Carne >= quantile(seguros$Carne, 0.75), 1, 0)
+```
+
+
+
+Se descartan las siguientes variables, por carecer de interés para el estudio que se realiza: C_postal, C_rcmat_culpa, C_rcmat_inoc, poliza, Edad, Expo, Carne, fini, fvto, Veh_cdin, Veh_val, Veh_peso, Veh_cuso, N_rcmat, N_rccorp, N_culpa, N_inoc, C_rccorp, Edad_Cat, veh_ant, Cus_des, clase_veh y Tipo_veh.
+
+
+```{r}
+data <- seguros %>% dplyr::select(-c(C_postal, C_rcmat_culpa, C_rcmat_inoc, poliza, fini, fvto, fpag, Veh_marca, Veh_cuso, Veh_peso, Veh_comb, Cus_des, ant_compnia, N_rcmat, N_rccorp, N_culpa, N_inoc, C_rcmat_agregado, C_rccorp, b7_longitud, b7_puertas, Tipo_veh, clase_veh, Score2, coste))
+```
+
+
+
+```{r}
+#table(seguros$pagar)
+data
+```
+
+
+
+Se calculan las correlaciones entre las variables en estudio, sin tener en cuenta el objetivo, accidente.
+
+
+```{r}
+# Calcular las correlaciones
+data_red<-data%>% dplyr::select(-c(accidente))
+correlation_matrix <- cor(data_red)
+ 
+# Visualizar las correlaciones utilizando un mapa de calor
+corrplot(correlation_matrix, method = "color", type = "upper", tl.col = "black", tl.srt = 45, addCoef.col = "black")
+```
+
+
+
+La mayor correlación se da entre precio y Veh_cdin, cuyo valor es de 0.63. Esto se debe a que los vehículos de las precios más elevados suelen tener algo más de cilindrada, ya que suelen ser marcas de gran potencia como Jaguar y Porsche. No se aprecian otras correlaciones relevantes entre el resto de variables, por lo que no es preciso eliminar ninguna de ellas.
+
+La variable experiencia se utilizará como tratamiento posteriormente.
+
+Por otro lado, se realiza el test Chi-Cuadrado, que indica si hay relación entre cada una de las variables anteriores y accidente.
+
+```{r}
+# Crear una lista para almacenar los resultados
+results <- list()
+
+# Realizar las pruebas de chi-cuadrado
+for (var in names(data_red)) {
+  # Ejecutar la prueba de chi-cuadrado
+  result <- chisq.test(table(data_red[[var]], data$accidente))
+  
+  # Agregar el resultado a la lista
+  results[[var]] <- result
+}
+
+# Mostrar los resultados
+for (var in names(results)) {
+  cat("Variable:", var, "\n")
+  print(results[[var]])
+  cat("\n")
+}
+
+
+```
+
+Es importante recordar que para este test se parte de la hipótesis nula de que ambas variables son independientes, así: valores altos de p-valor nos permitirán no considerar dichas variables en el estudio ya que no influirán sobre la variable a predecir. De este modo se tiene que tanto la edad como la exposición al riesgo, la antigüedad del vehículo y su precio influyen en la cantidad de accidentes si se considera un p-valor de 0.10.
+
+
+Finalmente, se cuenta con las siguientes variables para realizar el estudio: Edad, Carne, veh_ant y las dos variables que se han definido expresamente para el proyecto, que son precio y accidente.
+
+Se pasan a plantear una serie de hipótesis sobre las que trabajar, y se definen una serie de DAGs o grafos acíclicos dirigidos, que consisten en una proposición teórica de las posibles relaciones entre las variables en estudio.
+
+---------------------------------------------------------------------------------------------------------------
+
+## Hipótesis
+
+
+
+
+### DAG complejo
+
+El DAG siguiente es el más completo de todos, donde se contempla la posibilidad de que un gran número de variables estén relacionadas entre ellas e influyan de manera significativa sobre la siniestralidad, pero resulta muy complicado para aplicar sobre él las metodologías vistas, de modo que se optará por emplear DAGs algo más sencillos.
+
+
+```{r}
+
+dag_seguros_complejo <- dagitty( 'dag {
+    Edad -> Carnet            
+    Edad -> Precio           
+    Precio -> Siniestralidad         
+    Carnet-> Siniestralidad
+    Carnet-> Precio
+    Precio->  Cilindrada
+    Cilindrada-> Siniestralidad
+    Carnet-> Ant_vehiculo
+    Ant_vehiculo-> Siniestralidad
+    Carnet -> Experiencia
+    Experiencia -> Siniestralidad
+  }')
+coordinates(dag_seguros_complejo) <- list(
+  y=c(Edad=1,Precio=2,Siniestralidad=2,Tipo_coche=2,Carnet=1, Cilindrada = 1.5, Ant_vehiculo = 1, Experiencia = 1.25),
+  x=c(Edad=1,Precio=1,Siniestralidad=3,Tipo_coche=2,Carnet=2, Cilindrada = 2, Ant_vehiculo = 3, Experiencia = 2.65))
+
+plot(dag_seguros_complejo)
+```
+
+
+### DAGs más sencillo
+
+A continuación se muestran los que serían los DAGs más sencillo, asumiendo en primer lugar que el precio del vehículo influye directamente sobre la siniestralidad, o que el factor influyente es la experiencia del conductor. En estos casos habría un efecto directo de Precio o Experiencia sobre Siniestralidad. 
+
+```{r}
+dag_seguros_simple <- dagitty( 'dag {
+    Precio -> Siniestralidad            
+  }')
+coordinates(dag_seguros_simple) <- list(
+  y=c(Precio=1, Siniestralidad = 1),
+  x=c(Precio=1, Siniestralidad=2))
+
+plot(dag_seguros_simple)
+```
+
+```{r}
+dag_seguros_simple2 <- dagitty( 'dag {
+    Experiencia -> Siniestralidad            
+  }')
+coordinates(dag_seguros_simple2) <- list(
+  y=c(Experiencia=1, Siniestralidad = 1),
+  x=c(Experiencia=1, Siniestralidad=2))
+
+plot(dag_seguros_simple2)
+```
+
+### DAG de complejidad media
+
+En este DAG, de complejidad intermedia entre el primero y los 2 anteriores, muestra la posible influencia de la edad en las relaciones estudiadas, de modo que sería una variable de confusión. Será el caso que se estudia.
+
+
+```{r}
+dag_seguros <- dagitty( 'dag {
+    Edad -> Siniestralidad            
+    Edad -> Precio 
+    Precio -> Siniestralidad
+    Experiencia -> Siniestralidad
+    Edad -> Experiencia
+  }')
+coordinates(dag_seguros) <- list(
+  y=c(Precio=0,Siniestralidad=0,Edad=-1, Experiencia = -1),
+  x=c(Precio=0,Siniestralidad=1,Edad=0.5, Experiencia = 1))
+exposures(dag_seguros) <-"Precio" 
+outcomes(dag_seguros) <- "Siniestralidad"
+latents(dag_seguros) <- "Edad"
+
+plot(dag_seguros)
+```
+
+Hay que tener en cuenta que la elaboración de la estructura y las conexiones de los grafos son una aproximación a priori y no paramétrica de la influencia de las variables entre ellas. Sirven para analizar gráficamente diferentes enfoques del problema que se quiere estudiar viendo la influencia entre variables, para una vez definido un grafo de influencias razonable, dar el paso al análisis del problema.
+
+
+Para este estudio, se evaluarán los casos de PRECIO y EXPERIENCIA sobre la variable ACCIDENTE.
+
+# Selección de  metodología: Caso 1, Precio.
+
+
+En este caso se opta por usar métodos de matching para el ejemplo en estudio. 
+
+Se utiliza el método matching para comparar entre grupos tratados y no tratados, con el objetivo de realizar una estimación del efecto causal de la variable tratamiento. Este método sirve para equiparar las características entre individuos tratados y no tratados, para que las diferencias entre ambos conjuntos pueda atribuirse a los tratamientos, y no tanto a las diferencias entre los valores de cada una de las muestras entre ambos conjuntos.
+
+En este caso, se parean las muestras control con los tratados. Teniendo 21098 casos de no tratados (control), se parea el número de individuos tratados con observaciones no tratadas, en total 3902 pareados, dejando sin emparejar 17196 individuos no tratados.
+
+```{r}
+## Matching PRECIO
+m.ps.train.1 <- matchit(precio ~ Edad + Carne+veh_ant, 
+                        method="nearest",distance="glm", data = data)
+
+m.ps.train.1
+summary(m.ps.train.1)
+
+```
+
+
+```{r}
+# COMPROBAR EQUILIBRIO RESULTANTE
+bal.plot(m.ps.train.1,var.name = "distance",type="histogram",which="both",mirror = TRUE)
+
+```
+
+Con este 'balance plot', se pretende representar la calidad del emparejamiento entre los grupos de tratados y no tratados. Más concretamente, se representa la comparación entre los individuos tratados y no tratados, antes y después del emparejamiento. 
+
+Como se puede apreciar, ya de partida se puede considerar que las distribuciones no eran exageradamente diferentes, si bien es cierto que una vez realizado el emparejamiento con el método matching, las distribuciones entre individuos tratados y no tratados es casi idéntica.
+
+```{r}
+# Graficamente
+love.plot(m.ps.train.1,stats = c("m","var","ks"),abs = TRUE,thresholds=c(m=0.1,ks=0.05,var=2),bin="std")
+
+# # Tabular
+# bal.tab(m.ps.train.1,stats = c("m","var","ks"),thresholds=c(m=0.1,ks=0.05,var=2))
+```
+
+Con este gráfico, se muestra 3 estadísticos, antes y después del emparejamiento. 
+
+Con la primera representación, se muestra la diferencia en promedio entre las variables de los grupos tratados y no tratados. Se observa que una vez realizado el emparejamiento, la media de la diferencia en las variables se acerca a 0, a excepción de la variable edad.
+
+Con la segunda representación, se muestra las relaciones en varianza entre tratados y no tratados. En este caso, como en el anterior, las diferencias en varianza entre tratados y no tratados para las covariables seleccionadas se ven reducidas a niveles aceptables, a excepción de la variable edad, donde aumenta la diferencia en varianza una vez realizado el pareamiento.
+
+En último lugar, con la tercera representación, se muestran resultados del test Kolmogorov-Smirnov, antes y después del emparejamiento. Con un valor menor de 0.05, hace referencia a que no hay suficiente evidencia para afirmar que las distribuciones no se asemejan lo suficiente. Por tanto, para el caso de estudio, se puede afirmar que no existen diferencias relevantes entre las distribuciones de las covariables una vez realizado el método matching.
+
+
+
+Ahora se procede a obtener un modelo que nos permita ver la respuesta de nuestros datos frente al tratamiento aplicado.
+
+```{r}
+data.ps <- match.data(m.ps.train.1)
+
+fit.ps <- lm(accidente ~ precio * (Edad + Carne+veh_ant),
+           data = data.ps, weights = weights)
+```
+
+Se predice la respuesta
+
+```{r}
+library(marginaleffects)
+rdos.ps <- predictions(fit.ps,
+                       variables = "precio",
+                       vcov = ~subclass,   # estimacion robusta de se
+                       newdata = subset(data.ps, train == 1),
+                       wts = "weights", 
+                       by="precio")
+summary(rdos.ps)
+```
+
+De este modo, a pesar de que ambos valores son muy pequeños debido a que para la mayoría de pólizas la variable accidentes toma valor 0, se aprecia una diferencia entre la media de accidentes tenidos por ambos grupos si se considera un p-valor de 0.05 (que es el dado por el test). Así, se tiene que los coches cuyo valor nuevo supera los 30.000 euros tienen más accidentes que el resto.
+
+
+
+## Estimación del efecto y validación
+
+Primero se estima como son los efectos del tratamiento, para ello se usa una t de Student.
+
+```{r}
+t.test(accidente ~ experiencia, data)
+```
+
+p-valor=0.06611
+
+Ahora se procede a evaluar, para ello se recupera tanto el ATT como el ATE.
+
+```{r}
+data.ps <- data.ps %>%
+  mutate(ipw = case_when(
+    precio == 1 ~ 1/(distance),
+    precio == 0 ~ 1/(1-distance)),
+    ipw_att=case_when(
+      precio == 1 ~ 1,
+      precio == 0 ~ distance/(1-distance)))
+
+
+# Estimamos efecto ATE
+lm.ps.ate <- lm(accidente ~ precio, data = data.ps, weights = ipw)
+
+summary(lm.ps.ate)
+
+# Estimamos efecto ATT
+lm.ps.att <- lm(accidente ~ precio, data = data.ps, weights = ipw_att)
+
+summary(lm.ps.att)
+```
+
+
+# Selección de  metodología: Caso 2, Experiencia. 
+
+Se utiliza el método matching para comparar entre grupos tratados y no tratados, con el objetivo de realizar una estimación del efecto causal de la variable tratamiento. Este método sirve para equiparar las características entre individuos tratados y no tratados, para que las diferencias entre ambos conjuntos pueda atribuirse a los tratamientos, y no tanto a las diferencias entre los valores de cada una de las muestras entre ambos conjuntos.
+
+En este caso, se parean las muestras control con los tratados. Teniendo 18295 casos de no tratados (control), se parea el número de individuos tratados con observaciones no tratadas, en total 6705 emparejados, dejando sin emparejar 11590 individuos no tratados.
+
+```{r}
+## Matching EXPERIENCIA
+m.ps.train.2 <- matchit(experiencia ~  Veh_val + veh_ant + Veh_cdin, 
+                        method="nearest",distance="glm", data = data)
+
+m.ps.train.2
+summary(m.ps.train.2)
+
+```
+
+
+
+```{r}
+# COMPROBAR EQUILIBRIO RESULTANTE
+bal.plot(m.ps.train.2,var.name = "distance",type="histogram",which="both",mirror = TRUE)
+
+```
+
+Con este 'balance plot', se pretende representar la calidad del emparejamiento entre los grupos de tratados y no tratados. Más concretamente, se representa la comparación entre los individuos tratados y no tratados, antes y después del emparejamiento. 
+
+Como se puede apreciar, ya de partida se puede considerar que las distribuciones son muy parecidas, si bien es cierto que una vez realizado el emparejamiento con el método matching, las distribuciones entre individuos tratados y no tratados es prácticamente idéntica.
+
+```{r}
+# Graficamente
+love.plot(m.ps.train.2,stats = c("m","var","ks"),abs = TRUE,thresholds=c(m=0.1,ks=0.05,var=2),bin="std")
+
+# # Tabular
+# bal.tab(m.ps.train.1,stats = c("m","var","ks"),thresholds=c(m=0.1,ks=0.05,var=2))
+```
+
+Con este gráfico, se muestra 3 estadísticos, antes y después del emparejamiento. 
+
+Con la primera representación, se muestra la diferencia en promedio entre las variables de los grupos tratados y no tratados. Se observa que una vez realizado el emparejamiento, la media de la diferencia en las variables se acerca a 0, todas por debajo del umbral establecido.
+
+Con la segunda representación, se muestra las relaciones en varianza entre tratados y no tratados. En este caso, como en el anterior, las diferencias en varianza entre tratados y no tratados para las covariables seleccionadas se ven reducidas a niveles aceptables, a excepción de la variable Veh_val, donde aumenta la diferencia en varianza una vez realizado el pareamiento.
+
+En último lugar, con la tercera representación, se muestran resultados del test Kolmogorov-Smirnov, antes y después del emparejamiento. Con un valor menor de 0.05, hace referencia a que no hay suficiente evidencia para afirmar que las distribuciones no se asemejan lo suficiente. Por tanto, para el caso de estudio, se puede afirmar que no existen diferencias relevantes entre las distribuciones de las covariables una vez realizado el método matching.
+
+
+
+Ahora, de manera análoga al caso anterior, se procede a obtener un modelo que permita ver la respuesta de nuestros datos frente al tratamiento aplicado.
+
+```{r}
+data.ps2 <- match.data(m.ps.train.2)
+
+fit.ps2 <- lm(accidente ~ experiencia * (Veh_val +veh_ant),
+           data = data.ps2, weights = weights)
+```
+
+Se predice la respuesta
+
+```{r}
+library(marginaleffects)
+rdos.ps2 <- predictions(fit.ps2,
+                       variables = "experiencia",
+                       vcov = ~subclass,   # estimacion robusta de se
+                       newdata = subset(data.ps2, train == 1),
+                       wts = "weights", 
+                       by="experiencia")
+summary(rdos.ps2)
+```
+
+De este modo, de nuevo, a pesar de que ambos valores son muy pequeños debido a que para la mayoría de polizas la variable accidentes toma valor 0, se aprecia una diferencia entre la media de accidentes tenidos por ambos grupos si se contempla un p-valor de 0.05, dado por el propio test. Así, se obtiene que aquellos individuos que cuentan con muchos años de experiencia, tienen menos accidentes que aquellos con menos experiencia.
+
+
+## Estimación del efecto y validación
+
+Primero se estiman como son los efectos del tratamiento, para ello se hace uso de una t de Student.
+
+```{r}
+t.test(accidente ~ experiencia, data)
+```
+
+p-valor=0.06611
+
+Se evalúa, para ello ser recupera tanto el ATT como el ATE.
+
+```{r}
+data.ps2 <- data.ps2 %>%
+  mutate(ipw = case_when(
+    experiencia == 1 ~ 1/(distance),
+    experiencia == 0 ~ 1/(1-distance)),
+    ipw_att=case_when(
+      experiencia == 1 ~ 1,
+      experiencia == 0 ~ distance/(1-distance)))
+
+
+# Estimamos efecto ATE
+lm.ps.ate2 <- lm(accidente ~ experiencia, data = data.ps2, weights = ipw)
+
+summary(lm.ps.ate2)
+
+# Estimamos efecto ATT
+lm.ps.att2 <- lm(accidente ~ experiencia, data = data.ps2, weights = ipw_att)
+
+summary(lm.ps.att2)
+```
+
+
+# Discusión de resultados y conclusiones
+
+
+Se ha realizado un estudio sobre la influencia del precio de los vehículos y de los años de experiencia, por separado, sobre la posibilidad de sufrir un accidente.
+
+Tras el procesamiento de la cartera de seguros y el análisis exploratorio del conjunto escogido, se ha realizado un emparejamiento de muestras para poder extraer con mayor certeza el efecto del precio y la experiencia sobre los accidentes. 
+
+Aunque si cabe destacar que no se ha encontrado una diferencia claramente significativa, los resultados obtenidos sí que proporcionan una visión que encaja con lo que cabría esperarse. Se ha estimado, a partir de nuestros datos, que se espera que los individuos que poseen un coche de mayor valor (+30.000), sean más propensos a tener accidentes que aquellos individuos con vehículos de menor precio. Y, por otra parte, se ha estimado que aquellos individuos por encima de los 36 años de experiencia conduciendo o al menos con el carnet de coche (cuartil superior), sean menos propensos a sufrir un accidente.
